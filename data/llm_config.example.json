@@ -1,0 +1,70 @@
+{
+  "disable_fallbacks": true,
+  "models": {
+    "qwen": {
+      "type": "ollama",
+      "url": "http://localhost:11434",
+      "model": "gemma4:31b",
+      "timeout": 300
+    },
+    "claude": {
+      "type": "anthropic",
+      "model": "claude-opus-4-20250514",
+      "fallback_models": [
+        "claude-sonnet-4-20250514"
+      ],
+      "timeout": 120
+    },
+    "gpt": {
+      "type": "openai-codex",
+      "model": "gpt-5.4",
+      "timeout": 180
+    }
+  },
+  "tier_routing": {
+    "critical": "gpt",
+    "secondary": "gpt"
+  },
+  "call_sites": {
+    "news_analysis": {
+      "enabled": true,
+      "tier": "secondary",
+      "description": "Analyze news headlines for market impact"
+    },
+    "article_summarization": {
+      "enabled": false,
+      "tier": "secondary",
+      "description": "Summarize full article bodies before batch analysis"
+    },
+    "ta_interpretation": {
+      "enabled": true,
+      "tier": "secondary",
+      "description": "Interpret TA indicator confluence and chart patterns"
+    },
+    "correlation_reasoning": {
+      "enabled": true,
+      "tier": "critical",
+      "description": "Assess news/TA alignment with deeper reasoning"
+    },
+    "trade_validation": {
+      "enabled": true,
+      "tier": "critical",
+      "description": "Validate trade decision before execution"
+    },
+    "exit_analysis": {
+      "enabled": true,
+      "tier": "secondary",
+      "description": "Check if news catalyst has been invalidated for exits"
+    },
+    "risk_commentary": {
+      "enabled": true,
+      "tier": "secondary",
+      "description": "Contextual portfolio risk analysis and rebalance suggestions"
+    },
+    "learning_synthesis": {
+      "enabled": true,
+      "tier": "secondary",
+      "description": "Synthesize performance stats into strategy adjustments"
+    }
+  }
+}

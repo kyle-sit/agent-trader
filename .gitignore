@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets / env
+.env
+.env.*
+!.env.example
+
+# Local auth / credentials
+*.pem
+*.key
+*.crt
+
+# macOS
+.DS_Store
+
+# Local logs / outputs
+*.log
+
+# Project runtime data
+/data/*.jsonl
+/data/trade_log.jsonl
+/data/trade_outcomes.jsonl
+/data/runtime_log.jsonl
+/data/rebalance_log.jsonl
+/data/position_state.json
+/data/learned_patterns.json
+/data/scoring_weights.json
+/data/llm_config.json
+/data/portfolio_risk_rules.json
+
+# Optional local-only notes/state
+/data/*.sqlite
+/data/*.db
