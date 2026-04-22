@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Test all 3 market data sources."""
-import os
-os.environ['APCA_API_KEY_ID'] = os.getenv('APCA_API_KEY_ID', '')
-os.environ['APCA_API_SECRET_KEY'] = os.getenv('APCA_API_SECRET_KEY', '')
-os.environ['APCA_API_BASE_URL'] = 'https://paper-api.alpaca.markets'
+from env_utils import configure_alpaca_env, load_market_intel_env, warn_missing_credentials
+
+load_market_intel_env()
+ALPACA_ENV = configure_alpaca_env()
+warn_missing_credentials(ALPACA_ENV["missing"], context="test_all_sources / Alpaca")
 
 import finnhub
 import yfinance as yf

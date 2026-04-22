@@ -28,6 +28,7 @@ from typing import Optional
 
 import anthropic
 import finnhub
+from env_utils import configure_alpaca_env, load_market_intel_env, warn_missing_credentials
 
 # ── Config ──────────────────────────────────────────────────
 
@@ -35,8 +36,7 @@ BLOGWATCHER = Path.home() / "go" / "bin" / "blogwatcher"
 XBIRD = Path.home() / ".local" / "bin" / "xbird"
 
 # Load env
-from dotenv import load_dotenv
-load_dotenv(Path.home() / ".hermes" / ".env")
+load_market_intel_env()
 
 FINNHUB_KEY = os.getenv("FINNHUB_API_KEY", "")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_TOKEN", "") or os.getenv("ANTHROPIC_API_KEY", "")
@@ -173,9 +173,10 @@ def fetch_finnhub_news(limit: int = 20) -> list[dict]:
 
 def fetch_alpaca_news(limit: int = 20) -> list[dict]:
     """Get latest news from Alpaca/Benzinga."""
-    os.environ['APCA_API_KEY_ID'] = os.getenv('APCA_API_KEY_ID', '')
-    os.environ['APCA_API_SECRET_KEY'] = os.getenv('APCA_API_SECRET_KEY', '')
-    os.environ['APCA_API_BASE_URL'] = 'https://paper-api.alpaca.markets'
+    alpaca_env = configure_alpaca_env()
+    if alpaca_env["missing"]:
+        warn_missing_credentials(alpaca_env["missing"], context="News analyzer / Alpaca")
+        return []
 
     try:
         from alpaca_trade_api.rest import REST

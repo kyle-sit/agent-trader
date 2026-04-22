@@ -32,12 +32,10 @@ from collections import defaultdict
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from dotenv import load_dotenv
-load_dotenv(Path.home() / ".hermes" / ".env")
+from env_utils import configure_alpaca_env, warn_missing_credentials
 
-os.environ['APCA_API_KEY_ID'] = os.getenv('APCA_API_KEY_ID', '')
-os.environ['APCA_API_SECRET_KEY'] = os.getenv('APCA_API_SECRET_KEY', '')
-os.environ['APCA_API_BASE_URL'] = 'https://paper-api.alpaca.markets'
+ALPACA_ENV = configure_alpaca_env()
+warn_missing_credentials(ALPACA_ENV["missing"], context="Learning engine / Alpaca")
 
 
 # ── File Paths ──────────────────────────────────────────────

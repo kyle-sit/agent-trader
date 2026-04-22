@@ -24,12 +24,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from dotenv import load_dotenv
-load_dotenv(Path.home() / ".hermes" / ".env")
+from env_utils import configure_alpaca_env, warn_missing_credentials
 
-os.environ['APCA_API_KEY_ID'] = os.getenv('APCA_API_KEY_ID', '')
-os.environ['APCA_API_SECRET_KEY'] = os.getenv('APCA_API_SECRET_KEY', '')
-os.environ['APCA_API_BASE_URL'] = 'https://paper-api.alpaca.markets'
+ALPACA_ENV = configure_alpaca_env()
+warn_missing_credentials(ALPACA_ENV["missing"], context="Rebalance / Alpaca")
 
 from portfolio_risk import get_portfolio_data, check_risk_violations, load_risk_rules
 from signal_executor import reduce_position, close_position, cancel_symbol_orders

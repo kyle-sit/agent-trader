@@ -30,16 +30,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from correlation_engine import run_pipeline
-from dotenv import load_dotenv
-
-load_dotenv(Path.home() / ".hermes" / ".env")
+from env_utils import configure_alpaca_env, warn_missing_credentials
 
 # ── Config ──────────────────────────────────────────────────
 
 # Alpaca
-os.environ['APCA_API_KEY_ID'] = os.getenv('APCA_API_KEY_ID', '')
-os.environ['APCA_API_SECRET_KEY'] = os.getenv('APCA_API_SECRET_KEY', '')
-os.environ['APCA_API_BASE_URL'] = 'https://paper-api.alpaca.markets'
+ALPACA_ENV = configure_alpaca_env()
+warn_missing_credentials(ALPACA_ENV["missing"], context="Signal executor / Alpaca")
 
 # Discord alerts are sent directly via Hermes agent — no webhook needed
 
@@ -498,3 +495,377 @@ def print_status():
     print(f"     Mode: Hermes agent (direct to channel)")
 
     # Trade log
+    if TRADE_LOG_FILE.exists():
+        count = sum(1 for _ in open(TRADE_LOG_FILE))
+        print(f"\n  📋 Trade Log: {count} entries")
+    else:
+        print(f"\n  📋 Trade Log: Empty")
+
+
+# ── Main Pipeline ───────────────────────────────────────────
+
+def run_full_pipeline(sources="all", limit=10, watchlist=None, dry_run=False,
+                      alerts_only=False, auto_trade=True, deep=False):
+    """Run the complete pipeline: News → Analysis → TA → Correlate → Alert → Trade."""
+    run_started_at = datetime.now().isoformat()
+    t0 = time.time()
+    step_timings = {}
+
+    def finalize(results: dict):
+        total_seconds = round(time.time() - t0, 2)
+        results["runtime"] = {
+            "started_at": run_started_at,
+            "finished_at": datetime.now().isoformat(),
+            "total_seconds": total_seconds,
+            "step_seconds": step_timings,
+        }
+        log_runtime({
+            "mode": "dry_run" if dry_run else "alerts_only" if alerts_only or not auto_trade else "full",
+            "sources": sources,
+            "limit": limit,
+            "watchlist": watchlist,
+            "total_seconds": total_seconds,
+            "step_seconds": step_timings,
+            "headlines_analyzed": results.get("headlines_analyzed"),
+            "events_detected": results.get("events_detected"),
+            "tickers_analyzed": results.get("tickers_analyzed"),
+            "enter_signals": len([s for s in results.get("trade_signals", []) if s.get("action") == "enter"]),
+            "watch_signals": len([s for s in results.get("trade_signals", []) if s.get("action") == "watch"]),
+            "execution_summary": results.get("execution_summary"),
+        })
+        print(f"\n⏱️  Runtime: {total_seconds:.2f}s total")
+        for step_name, secs in step_timings.items():
+            print(f"   {step_name}: {secs:.2f}s")
+        return results
+
+    step_start = time.time()
+    results = run_pipeline(
+        sources=sources,
+        limit=limit,
+        watchlist=watchlist,
+        dry_run=dry_run,
+        deep=deep,
+    )
+    step_timings["step1_5_pipeline"] = round(time.time() - step_start, 2)
+
+    signals = results.get("trade_signals", [])
+    enter_signals = [s for s in signals if s["action"] == "enter"]
+
+    print(f"\n📢 STEP 6: Sending alerts...")
+    step_start = time.time()
+    discord_msg = format_discord_message(results)
+    webhook_url = os.getenv("DISCORD_WEBHOOK_URL", "")
+    if webhook_url:
+        success = send_discord_alert(discord_msg, webhook_url)
+        print(f"   Discord: {'✅ Sent' if success else '❌ Failed'}")
+    else:
+        print(f"   Alerts delivered via Hermes agent (this channel)")
+        print(f"\n{discord_msg}")
+    step_timings["step6_alerts"] = round(time.time() - step_start, 2)
+
+    if alerts_only or dry_run or not auto_trade:
+        reason = "DRY RUN" if dry_run else "ALERTS ONLY" if alerts_only else "NO TRADE"
+        print(f"\n   [{reason}] Skipping trade execution.")
+        results["execution_summary"] = {"mode": reason.lower().replace(' ', '_'), "executed": 0, "skipped": 0}
+        return finalize(results)
+
+    if not enter_signals:
+        print(f"\n📈 STEP 7: No ENTER signals to execute.")
+        results["execution_summary"] = {"mode": "full", "executed": 0, "skipped": 0}
+        return finalize(results)
+
+    print(f"\n📈 STEP 7: Executing {len(enter_signals)} paper trades...")
+    step_start = time.time()
+
+    try:
+        account = get_account_info()
+        portfolio_value = account["portfolio_value"]
+        positions = get_positions()
+        open_orders = get_open_orders()
+        portfolio_snapshot = get_portfolio_data()
+    except Exception as e:
+        print(f"   ❌ Alpaca error: {e}")
+        results["execution_summary"] = {"mode": "full", "executed": 0, "skipped": 0, "error": str(e)}
+        step_timings["step7_execution"] = round(time.time() - step_start, 2)
+        return finalize(results)
+
+    if len(positions) >= MAX_OPEN_POSITIONS:
+        print(f"   ⚠️  Max positions ({MAX_OPEN_POSITIONS}) reached — skipping new trades")
+        results["execution_summary"] = {"mode": "full", "executed": 0, "skipped": len(enter_signals), "reason": "max_positions_reached"}
+        step_timings["step7_execution"] = round(time.time() - step_start, 2)
+        return finalize(results)
+
+    executed = []
+    skipped = []
+    candidate_meta = []
+
+    for signal in enter_signals:
+        ticker = signal["ticker"]
+        entry = signal.get("entry") or 0
+        stop_loss = signal.get("stop_loss") or 0
+        proposed_qty = calculate_position_size(portfolio_value, entry, symbol=ticker, stop_loss=stop_loss)
+        proposed_size_pct = ((proposed_qty * entry) / portfolio_value * 100) if portfolio_value and entry and proposed_qty else 0.0
+        trade_risk_pct = calculate_trade_risk_pct(entry, stop_loss, proposed_qty, portfolio_value) if proposed_qty else 0.0
+        existing_position = next((p for p in positions if p["symbol"] == ticker), None)
+        existing_side = existing_position.get("side") if existing_position else None
+        signal_direction = signal.get("direction", "long")
+        same_direction = bool(existing_position and existing_side == signal_direction)
+        opposite_direction = bool(existing_position and existing_side != signal_direction)
+
+        conviction_rank = {"high": 3, "medium": 2, "low": 1}
+        min_rank = conviction_rank.get(MIN_CONVICTION, 2)
+        sig_rank = conviction_rank.get(signal.get("conviction", "low"), 1)
+        if sig_rank < min_rank:
+            skipped.append({"symbol": ticker, "reason": f"Conviction {signal['conviction']} below threshold {MIN_CONVICTION}"})
+            print(f"   ⏭️  {ticker}: Conviction too low ({signal['conviction']}) — skipping")
+            continue
+
+        rr = signal.get("risk_reward", 0)
+        if rr and rr < MIN_RISK_REWARD:
+            skipped.append({"symbol": ticker, "reason": f"R:R {rr} below threshold {MIN_RISK_REWARD}"})
+            print(f"   ⏭️  {ticker}: R:R too low ({rr}) — skipping")
+            continue
+
+        portfolio_ctx = build_portfolio_context(
+            signal,
+            positions,
+            open_orders,
+            portfolio_snapshot,
+            proposed_qty,
+            proposed_size_pct,
+            trade_risk_pct,
+        )
+        candidate_meta.append({
+            "signal": signal,
+            "ticker": ticker,
+            "entry": entry,
+            "stop_loss": stop_loss,
+            "proposed_qty": proposed_qty,
+            "proposed_size_pct": proposed_size_pct,
+            "trade_risk_pct": trade_risk_pct,
+            "existing_position": existing_position,
+            "same_direction": same_direction,
+            "opposite_direction": opposite_direction,
+            "signal_direction": signal_direction,
+            "portfolio_context": portfolio_ctx,
+        })
+
+    batch_decisions = {}
+    if candidate_meta:
+        batch_start = time.time()
+        try:
+            from llm_hooks import validate_trades_batch
+            batch_decisions = validate_trades_batch(candidate_meta)
+        except (ImportError, Exception):
+            batch_decisions = {}
+        step_timings["step7_trade_validation_batch"] = round(time.time() - batch_start, 2)
+
+    for meta in candidate_meta:
+        signal = meta["signal"]
+        ticker = meta["ticker"]
+        existing_position = meta["existing_position"]
+        same_direction = meta["same_direction"]
+        opposite_direction = meta["opposite_direction"]
+        signal_direction = meta["signal_direction"]
+        entry = meta["entry"]
+        stop_loss = meta["stop_loss"]
+        proposed_qty = meta["proposed_qty"]
+
+        validation = batch_decisions.get(ticker)
+        if not validation:
+            validation = {
+                "approved": True,
+                "action": "hold_existing" if same_direction else "reverse_position" if opposite_direction else "open_new",
+                "reason": "No batched LLM decision available; using deterministic fallback.",
+                "size_fraction": 1.0,
+                "reduce_fraction": 0.5 if opposite_direction else 0.0,
+                "cancel_existing_orders": False,
+                "warnings": [],
+            }
+
+        action = validation.get("action", "skip")
+        approved = validation.get("approved", True)
+        size_fraction = float(validation.get("size_fraction", 1.0) or 0.0)
+        reduce_fraction = float(validation.get("reduce_fraction", 0.0) or 0.0)
+        reason = validation.get("reason", "")
+
+        print(
+            f"   🧠 {ticker}: decision action={action} approved={approved} "
+            f"size_fraction={size_fraction:.2f} reduce_fraction={reduce_fraction:.2f}"
+        )
+        if reason:
+            print(f"      reason: {reason[:180]}")
+        for warn in validation.get("warnings", []):
+            print(f"   ⚠️  {warn}")
+
+        if validation.get("cancel_existing_orders"):
+            cancel_result = cancel_symbol_orders(ticker)
+            if cancel_result.get("cancelled_order_ids"):
+                print(f"   🧹 {ticker}: Cancelled {len(cancel_result['cancelled_order_ids'])} open order(s)")
+            open_orders = get_open_orders()
+
+        if action == "skip":
+            skipped.append({"symbol": ticker, "reason": f"LLM skipped: {reason}"})
+            print(f"   🧠 {ticker}: SKIP — {reason[:100]}")
+            continue
+        if not approved and action in {"open_new", "add_to_position", "reverse_position"}:
+            skipped.append({"symbol": ticker, "reason": f"LLM not approved: {reason}"})
+            print(f"   🧠 {ticker}: NOT APPROVED — {reason[:100]}")
+            continue
+        if action == "hold_existing":
+            skipped.append({"symbol": ticker, "reason": f"Hold existing: {reason}"})
+            print(f"   🧠 {ticker}: HOLD EXISTING — {reason[:100]}")
+            continue
+
+        if action == "reduce_position":
+            if not existing_position:
+                skipped.append({"symbol": ticker, "reason": "LLM requested reduce but no existing position"})
+                print(f"   ⏭️  {ticker}: Reduce requested but no existing position — skipping")
+                continue
+            reduce_qty = max(int(abs(existing_position["qty"]) * reduce_fraction), 1)
+            print(f"   🔄 {ticker}: Reducing position by {reduce_qty} share(s)...")
+            trade_result = reduce_position(ticker, reduce_qty, existing_position["side"])
+            if trade_result["success"]:
+                print(f"   ✅ {ticker}: Reduced {reduce_qty} share(s)")
+                executed.append(trade_result)
+                log_trade({"signal": signal, "execution": trade_result, "account_value": portfolio_value, "llm_decision": validation})
+                positions = get_positions(); open_orders = get_open_orders(); portfolio_snapshot = get_portfolio_data()
+            else:
+                print(f"   ❌ {ticker}: {trade_result.get('error', 'Unknown error')}")
+            continue
+
+        if action == "reverse_position":
+            if not existing_position:
+                action = "open_new"
+            else:
+                print(f"   🔄 {ticker}: Reversing existing {existing_position['side']} position...")
+                close_result = close_position(ticker)
+                if not close_result.get("success"):
+                    skipped.append({"symbol": ticker, "reason": f"Failed to close before reversal: {close_result.get('error', '')}"})
+                    print(f"   ❌ {ticker}: Failed to close before reversal — {close_result.get('error', '')}")
+                    continue
+                positions = get_positions(); open_orders = get_open_orders(); portfolio_snapshot = get_portfolio_data()
+                print(f"   ✅ {ticker}: Closed prior position, proceeding with reversal")
+                action = "open_new"
+
+        if action == "add_to_position" and not same_direction:
+            skipped.append({"symbol": ticker, "reason": f"LLM requested add but position direction mismatch: {reason}"})
+            print(f"   ⏭️  {ticker}: Add requested but direction mismatch — skipping")
+            continue
+        if action in {"open_new", "add_to_position"} and proposed_qty <= 0:
+            skipped.append({"symbol": ticker, "reason": "Position size reduced to zero by risk limits"})
+            print(f"   🚫 {ticker}: Position size reduced to zero by risk limits")
+            continue
+
+        adjusted_qty = compute_adjusted_qty(proposed_qty, size_fraction) if action in {"open_new", "add_to_position"} else 0
+        adjusted_size_pct = ((adjusted_qty * entry) / portfolio_value * 100) if portfolio_value and entry and adjusted_qty else 0.0
+        adjusted_risk_pct = calculate_trade_risk_pct(entry, stop_loss, adjusted_qty, portfolio_value) if adjusted_qty else 0.0
+
+        if action in {"open_new", "add_to_position"}:
+            risk = check_new_trade(
+                ticker,
+                side=signal_direction,
+                size_pct=adjusted_size_pct,
+                trade_risk_pct=adjusted_risk_pct,
+                pending_orders=open_orders,
+            )
+            if not risk["allowed"]:
+                reasons = "; ".join(v["message"] for v in risk["violations"])
+                skipped.append({"symbol": ticker, "reason": f"Risk violation: {reasons}"})
+                print(f"   🚫 {ticker}: BLOCKED by risk rules — {reasons}")
+                continue
+
+            action_label = "ADDING TO" if action == "add_to_position" else "EXECUTING"
+            print(f"   🔄 {ticker}: {action_label} {signal_direction.upper()} ({adjusted_qty} shares)...")
+            trade_result = execute_trade(signal, portfolio_value, qty_override=adjusted_qty)
+            if trade_result["success"]:
+                qty = trade_result.get("qty", 0)
+                verb = "Added" if action == "add_to_position" else signal_direction.upper()
+                print(f"   ✅ {ticker}: {verb} {qty} shares @ market")
+                if trade_result.get("stop_price"):
+                    print(f"      Stop loss: ${trade_result['stop_price']}")
+                if trade_result.get("target_price"):
+                    print(f"      Take profit: ${trade_result['target_price']}")
+                log_trade({"signal": signal, "execution": trade_result, "account_value": portfolio_value, "llm_decision": validation})
+                executed.append(trade_result)
+                positions = get_positions(); open_orders = get_open_orders(); portfolio_snapshot = get_portfolio_data()
+            else:
+                print(f"   ❌ {ticker}: {trade_result.get('error', 'Unknown error')}")
+            continue
+
+        skipped.append({"symbol": ticker, "reason": f"Unhandled action {action}: {reason}"})
+        print(f"   ⏭️  {ticker}: Unhandled action {action} — skipping")
+
+    step_timings["step7_execution"] = round(time.time() - step_start, 2)
+    results["execution_summary"] = {
+        "mode": "full",
+        "executed": len(executed),
+        "skipped": len(skipped),
+        "trades": [t.get("symbol") for t in executed],
+    }
+
+    print(f"\n{'=' * 70}")
+    print(f"  EXECUTION SUMMARY")
+    print(f"  Executed: {len(executed)} | Skipped: {len(skipped)}")
+    if executed:
+        print(f"  Trades: {', '.join(t['symbol'] for t in executed)}")
+    print(f"{'=' * 70}")
+
+    return finalize(results)
+
+
+# ── Main ────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Signal Executor — Alerts + Paper Trading")
+    parser.add_argument("--source", type=str, default="all", choices=["rss", "finnhub", "alpaca", "twitter", "all"])
+    parser.add_argument("--watchlist", "-w", type=str, help="Focus watchlist")
+    parser.add_argument("--limit", type=int, default=10, help="Headlines per source")
+    parser.add_argument("--dry-run", action="store_true", help="Heuristic smoke test: no LLM analysis and no paper trades")
+    parser.add_argument("--deep", action="store_true", help="Extract full article bodies for richer analysis")
+    parser.add_argument("--alerts-only", action="store_true", help="Run full GPT/LLM analysis and send alerts, but do not place trades")
+    parser.add_argument("--no-trade", action="store_true", help="Alias for alerts-only: skip trade execution while keeping normal analysis")
+    parser.add_argument("--positions", action="store_true", help="Show current positions")
+    parser.add_argument("--close", type=str, help="Close a position by symbol")
+    parser.add_argument("--status", action="store_true", help="Full system status")
+    parser.add_argument("--json", action="store_true", help="JSON output")
+    args = parser.parse_args()
+
+    if args.positions:
+        print_positions()
+        return
+
+    if args.status:
+        print_status()
+        return
+
+    if args.close:
+        result = close_position(args.close.upper())
+        if result["success"]:
+            print(f"✅ Closed position: {args.close.upper()}")
+        else:
+            print(f"❌ Failed: {result.get('error')}")
+        return
+
+    print("=" * 70)
+    print(f"  SIGNAL EXECUTOR — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    mode = 'Dry Run (Heuristics + Alerts, No Trades)' if args.dry_run else 'Alerts Only' if args.alerts_only or args.no_trade else 'Full (Alerts + Paper Trades)'
+    print(f"  Mode: {mode}")
+    print("=" * 70)
+
+    results = run_full_pipeline(
+        sources=args.source,
+        limit=args.limit,
+        watchlist=args.watchlist,
+        dry_run=args.dry_run,
+        alerts_only=args.alerts_only or args.no_trade or args.dry_run,
+        auto_trade=not (args.alerts_only or args.no_trade or args.dry_run),
+        deep=args.deep,
+    )
+
+    if args.json:
+        print(json.dumps(results, indent=2))
+
+
+if __name__ == "__main__":
+    main()
